@@ -3,7 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { WalletAdapterProvider } from "./components/WalletAdapterProvider";
 import { ToastProvider } from "../providers/ToastProvider";
-import { ThemeProvider } from "./context/ThemeContext";
+import { ThemeProvider, ThemeInitScript } from "../lib/theme";
 import { I18nProvider } from "./providers/I18nProvider";
 import Footer from "./components/Footer";
 import MarketListPreloader from "./components/MarketListPreloader";
@@ -52,6 +52,9 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <ThemeInitScript />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
