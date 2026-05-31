@@ -2262,6 +2262,274 @@ fn test_get_pool_volume_unknown_pool_is_zero() {
     assert_eq!(client.get_total_contract_volume(), 0);
 }
 
+// ── Volume-based fee tiers ────────────────────────────────────────────────────
+
+/// Create a pool with a single winner and single loser of the given amounts,
+/// settle it, and return `(settlement_protocol_fee, winner_payout)`. Advances
+/// the ledger past the pool's expiry before settling.
+fn tiered_pool_fee_and_payout(
+    env: &Env,
+    client: &PredinexContractClient,
+    token_admin_client: &token::StellarAssetClient,
+    winner_amt: i128,
+    loser_amt: i128,
+) -> (i128, i128) {
+    let creator = Address::generate(env);
+    let winner = Address::generate(env);
+    let loser = Address::generate(env);
+    token_admin_client.mint(&winner, &winner_amt);
+    token_admin_client.mint(&loser, &loser_amt);
+
+    let now = env.ledger().timestamp();
+    let pool_id = client.create_pool(
+        &creator,
+        &String::from_str(env, "Tier Market"),
+        &String::from_str(env, "Desc"),
+        &String::from_str(env, "Yes"),
+        &String::from_str(env, "No"),
+        &3600,
+    );
+    client.place_bet(&winner, &pool_id, &0, &winner_amt, &None::<Address>);
+    client.place_bet(&loser, &pool_id, &1, &loser_amt, &None::<Address>);
+
+    env.ledger().with_mut(|li| li.timestamp = now + 3601);
+    client.settle_pool(&creator, &pool_id, &0);
+
+    let fee = client
+        .get_pool_protocol_revenue(&pool_id)
+        .settlement_protocol_fee;
+    let payout = client.claim_winnings(&winner, &pool_id);
+    (fee, payout)
+}
+
+/// Below the first tier → flat default fee; within a tier → that tier's fee;
+/// above the highest tier → the highest tier's fee. The settlement fee and the
+/// winner payout both reflect the resolved tier.
+#[test]
+fn test_volume_fee_tiers_resolution() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+    // Treasury recipient == token_admin (authorised to configure tiers).
+    client.initialize(&token_id.address(), &token_admin);
+
+    // Default protocol fee is 200 bps (2%). Two tiers below that.
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                volume_threshold: 1000,
+                fee_bps: 100,
+            }, // >= 1000 → 1%
+            FeeTier {
+                volume_threshold: 5000,
+                fee_bps: 50,
+            }, // >= 5000 → 0.5%
+        ],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+
+    // Volume 500 (below first tier) → default 2% → fee 10, payout 490.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 300, 200);
+    assert_eq!(fee, 10, "below first tier uses default fee");
+    assert_eq!(payout, 490);
+
+    // Volume 2000 (within first tier) → 1% → fee 20, payout 1980.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 1200, 800);
+    assert_eq!(fee, 20, "within tier uses tier fee");
+    assert_eq!(payout, 1980);
+
+    // Volume 6000 (above highest tier) → 0.5% → fee 30, payout 5970.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 4000, 2000);
+    assert_eq!(fee, 30, "above highest tier uses highest tier fee");
+    assert_eq!(payout, 5970);
+}
+
+/// With no tiers configured the contract uses the flat protocol fee (backward
+/// compatible), even when a tier-capable build is deployed.
+#[test]
+fn test_volume_fee_tiers_unconfigured_is_flat_fee() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id.address());
+    client.initialize(&token_id.address(), &token_admin);
+
+    assert!(client.get_volume_fee_tiers().is_empty());
+
+    // Volume 6000, no tiers → flat 2% → fee 120, payout 5880.
+    let (fee, payout) = tiered_pool_fee_and_payout(&env, &client, &token_admin_client, 4000, 2000);
+    assert_eq!(fee, 120);
+    assert_eq!(payout, 5880);
+}
+
+/// Setting tiers emits a `fee_tiers_updated` event and an empty vector clears them.
+#[test]
+fn test_set_volume_fee_tiers_event_and_clear() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [FeeTier {
+            volume_threshold: 1000,
+            fee_bps: 100,
+        }],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+
+    // The event emitted by set_volume_fee_tiers is fee_tiers_updated. Read it
+    // before any further contract call (the event buffer reflects the most
+    // recent invocation only).
+    let events = env.events().all();
+    let last_event = events.last().expect("must emit an event");
+    let topics = last_event.1;
+    let name: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &topics.get(0).unwrap());
+    assert_eq!(name, soroban_sdk::Symbol::new(&env, "fee_tiers_updated"));
+
+    assert_eq!(client.get_volume_fee_tiers().len(), 1);
+
+    // Empty vector clears configured tiers.
+    let empty = soroban_sdk::Vec::<FeeTier>::new(&env);
+    client.set_volume_fee_tiers(&token_admin, &empty);
+    assert!(client.get_volume_fee_tiers().is_empty());
+}
+
+/// More than MAX_FEE_TIERS (5) tiers is rejected.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_too_many_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                volume_threshold: 100,
+                fee_bps: 90,
+            },
+            FeeTier {
+                volume_threshold: 200,
+                fee_bps: 80,
+            },
+            FeeTier {
+                volume_threshold: 300,
+                fee_bps: 70,
+            },
+            FeeTier {
+                volume_threshold: 400,
+                fee_bps: 60,
+            },
+            FeeTier {
+                volume_threshold: 500,
+                fee_bps: 50,
+            },
+            FeeTier {
+                volume_threshold: 600,
+                fee_bps: 40,
+            },
+        ],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+}
+
+/// Non-ascending thresholds are rejected.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_non_ascending_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [
+            FeeTier {
+                volume_threshold: 5000,
+                fee_bps: 50,
+            },
+            FeeTier {
+                volume_threshold: 1000,
+                fee_bps: 100,
+            },
+        ],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+}
+
+/// A fee_bps above the protocol maximum is rejected.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_fee_out_of_bounds_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [FeeTier {
+            volume_threshold: 1000,
+            fee_bps: 1001,
+        }],
+    );
+    client.set_volume_fee_tiers(&token_admin, &tiers);
+}
+
+/// Only the treasury recipient may configure fee tiers.
+#[test]
+#[should_panic]
+fn test_set_volume_fee_tiers_unauthorized_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PredinexContract, ());
+    let client = PredinexContractClient::new(&env, &contract_id);
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+    client.initialize(&token_id.address(), &token_admin);
+
+    let attacker = Address::generate(&env);
+    let tiers = soroban_sdk::Vec::from_array(
+        &env,
+        [FeeTier {
+            volume_threshold: 1000,
+            fee_bps: 100,
+        }],
+    );
+    client.set_volume_fee_tiers(&attacker, &tiers);
+}
+
 // ── Issue #173: get_claim_status read method ──────────────────────────────────
 
 /// Transitions for a winning bettor: NeverBet → NotEligible (open) → Claimable → AlreadyClaimed.

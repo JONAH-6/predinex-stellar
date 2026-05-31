@@ -448,6 +448,26 @@ Emitted when a per-address exemption from the pool creation fee is granted or re
 
 ---
 
+### 15. `fee_tiers_updated`
+
+Emitted when the volume-based protocol fee tiers are configured or cleared.
+
+**Trigger:** `PredinexContract::set_volume_fee_tiers`
+
+**Topics tuple:**
+```
+(Symbol("fee_tiers_updated"), Symbol("v1"))
+```
+
+**Data:**
+```
+tier_count: u32   // number of tiers now configured; 0 means tiers were cleared
+```
+
+Tiers apply at settlement: the contract selects the highest `(volume_threshold, fee_bps)` tier whose threshold is `<=` the pool's total volume; pools below the first tier (and all pools when no tiers are configured) use the flat `ProtocolFee`.
+
+---
+
 ## Parsing guide for frontend / indexers
 
 ### Topic structure
