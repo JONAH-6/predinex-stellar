@@ -55,6 +55,12 @@ fn event_version(env: &Env) -> Symbol {
     Symbol::new(env, EVENT_SCHEMA_VERSION)
 }
 
+// Dispute window: 7 days in seconds (configurable in future)
+const DISPUTE_WINDOW_SECS: u64 = 7 * 24 * 3600;
+
+// Precision multiplier for LP fee-per-share accumulator (avoids rounding to zero)
+const LP_PRECISION: i128 = 1_000_000_000;
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
